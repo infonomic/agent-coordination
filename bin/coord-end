@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Close a run, cleaning up according to the retention policy it declared.
+
+Promoting a transcript full of object ids does not keep those objects alive. Once a
+run's references are deleted, garbage collection can remove the snapshots and the
+transcript becomes a list of identifiers nobody can review.
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+POLICIES = ("keep-refs", "bundle", "discard")
+
+
+def die(msg):
+    sys.stderr.write("coord-end: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        die("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r.stdout
+
+
+def run_refs(repo, run):
+    prefix = "refs/coord/%s/" % run
+    out = git(repo, "for-each-ref", "--format=%(refname)", "refs/coord/" + run)
+    return [line for line in out.decode().split() if line.startswith(prefix)]
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--repo", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--retention", required=True, choices=POLICIES)
+    p.add_argument("--archive", help="bundle path, required for --retention bundle")
+    args = p.parse_args()
+
+    refs = run_refs(args.repo, args.run)
+    if not refs:
+        sys.stderr.write("coord-end: no snapshots found for run %s\n" % args.run)
+
+    if args.retention == "keep-refs":
+        print("retained %d snapshot ref(s) for run %s" % (len(refs), args.run))
+        return
+
+    if args.retention == "bundle":
+        if not args.archive:
+            die("--archive is required for --retention bundle; refusing to delete "
+                "references with nowhere to archive them")
+        if not refs:
+            die("nothing to archive for run %s" % args.run)
+        git(args.repo, "bundle", "create", args.archive, *refs)
+        for ref in refs:
+            git(args.repo, "update-ref", "-d", ref)
+        print("archived %d snapshot(s) to %s and released their refs" % (len(refs), args.archive))
+        return
+
+    for ref in refs:
+        git(args.repo, "update-ref", "-d", ref)
+    sys.stderr.write("coord-end: %d snapshot ref(s) deleted under 'discard'; archived "
+                     "transcripts for run %s are now no longer independently "
+                     "reviewable\n" % (len(refs), args.run))
+    print("discarded %d snapshot ref(s)" % len(refs))
+
+
+if __name__ == "__main__":
+    main()

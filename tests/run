@@ -1,0 +1,20 @@
+#!/bin/sh
+# Run every helper test suite. Fixtures are the cases that broke earlier designs.
+# Each suite's real exit status is captured before its output is truncated --
+# piping into tail would report tail's status, hiding every failure.
+cd "$(dirname "$0")" || exit 1
+status=0
+log=$(mktemp)
+for suite in test_coord_*.py; do
+  echo "== $suite"
+  if python3 "$suite" >"$log" 2>&1; then
+    tail -3 "$log"
+  else
+    status=1
+    tail -20 "$log"
+    echo "-- $suite FAILED"
+  fi
+done
+rm -f "$log"
+[ "$status" -eq 0 ] && echo "all suites passed"
+exit "$status"

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Publish one immutable message into a coordination mailbox.
+
+Publication is a hard link, not a rename: os.link refuses an existing destination
+where os.rename would silently clobber a published message. A refused publish
+leaves the mailbox and the staging directory exactly as it found them.
+"""
+import argparse
+import os
+import secrets
+import sys
+import tempfile
+import time
+
+TYPES = ("handshake", "handshake-ack", "handoff", "review", "revision",
+         "question", "decision", "status", "end")
+OUTCOMES = ("approved", "changes-requested", "needs-user-input", "blocked")
+ROLES = ("implementer", "reviewer")
+
+
+def die(msg):
+    sys.stderr.write("coord-publish: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def new_id(role, kind):
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return "%s-%s-%s-%s" % (stamp, role, kind, secrets.token_hex(6))
+
+
+def frontmatter(args, message_id):
+    fields = [
+        ("id", message_id),
+        ("run", args.run or os.path.basename(os.path.normpath(args.mailbox))),
+        ("from", getattr(args, "from")),
+        ("to", args.to),
+        ("type", args.type),
+        ("at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        ("reply_to", args.reply_to or "null"),
+        ("supersedes", args.supersedes or "null"),
+        ("checkpoint", args.checkpoint or "null"),
+        ("base", args.base or "null"),
+        ("snapshot", args.snapshot or "null"),
+        ("patch_manifest", args.patch_manifest or "null"),
+        ("env_manifest", args.env_manifest or "null"),
+    ]
+    if args.outcome:
+        fields.append(("outcome", args.outcome))
+    if args.scope:
+        fields.append(("scope", "[%s]" % ", ".join(args.scope)))
+    body = "---\n"
+    for key, value in fields:
+        body += "%s: %s\n" % (key, value)
+    return body + "---\n\n"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mailbox", required=True)
+    p.add_argument("--from", required=True, choices=ROLES)
+    p.add_argument("--to", required=True, choices=ROLES)
+    p.add_argument("--type", required=True)
+    p.add_argument("--body", required=True, help="file holding the message body")
+    p.add_argument("--run")
+    p.add_argument("--reply-to")
+    p.add_argument("--supersedes")
+    p.add_argument("--checkpoint")
+    p.add_argument("--base")
+    p.add_argument("--snapshot")
+    p.add_argument("--patch-manifest")
+    p.add_argument("--env-manifest")
+    p.add_argument("--scope", nargs="+")
+    p.add_argument("--outcome", choices=OUTCOMES)
+    p.add_argument("--force-id", help="publish under this exact id (collision testing)")
+    args = p.parse_args()
+
+    if args.type not in TYPES:
+        die("unknown message type %r; expected one of %s" % (args.type, ", ".join(TYPES)))
+    if args.outcome and args.type != "review":
+        die("outcome is only valid on a review message, not %r" % args.type)
+    if args.type == "review" and not args.outcome:
+        die("a review must carry an outcome: %s" % ", ".join(OUTCOMES))
+
+    messages = os.path.join(args.mailbox, "messages")
+    staging = os.path.join(args.mailbox, "tmp")
+    for d in (messages, staging):
+        if not os.path.isdir(d):
+            die("mailbox is missing %s/ - run coord-check --init first" % os.path.basename(d))
+    if not os.path.isfile(args.body):
+        die("no such body file %r" % args.body)
+
+    message_id = args.force_id or new_id(getattr(args, "from"), args.type)
+    with open(args.body, "rb") as f:
+        body = f.read()
+
+    target = os.path.join(messages, message_id + ".md")
+    # A crash between link and unlink leaves a staged hard link to the published
+    # message. Opening a predictable staging name with truncation would then destroy
+    # an immutable message on retry, so every attempt gets a fresh exclusive file.
+    handle, staged = tempfile.mkstemp(prefix=message_id + ".", suffix=".staging",
+                                      dir=staging)
+    with os.fdopen(handle, "wb") as f:
+        f.write(frontmatter(args, message_id).encode())
+        f.write(body)
+    try:
+        os.link(staged, target)     # refuses an existing destination
+    except FileExistsError:
+        os.remove(staged)
+        die("message %s already published - messages are immutable; publish a new "
+            "message carrying supersedes: instead" % message_id)
+    except OSError as e:
+        os.remove(staged)
+        die("could not publish %s: %s" % (message_id, e.strerror))
+    os.remove(staged)
+    print(message_id)
+
+
+if __name__ == "__main__":
+    main()

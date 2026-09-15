@@ -1,0 +1,6 @@
+interface:
+  display_name: "Coordinate With Agent"
+  short_description: "Exchange handoffs and reviews with a second agent session"
+  default_prompt: "Use $coordinate to join or continue a coordinated implementation/review run."
+policy:
+  allow_implicit_invocation: false

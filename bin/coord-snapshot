@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Mint a review snapshot outside branch history.
+
+This writes git metadata - a commit object and a reference - while leaving the
+branch, HEAD, and the real index untouched. Authorization to mint review snapshots
+is therefore distinct from, and does not imply, authorization to commit
+implementation changes onto the branch.
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ATTEMPTS = 3
+
+# The mailbox lives inside the repository under coordination. It is protocol
+# traffic, not reviewable content: if publishing a message counted as an
+# environment change, handing off would invalidate the review it carries.
+ALWAYS_EXCLUDED = (".coord",)
+
+
+def die(msg):
+    sys.stderr.write("coord-snapshot: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def git(repo, *args, env=None, check=True):
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    r = subprocess.run(["git", "-C", repo, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=e)
+    if check and r.returncode != 0:
+        die("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r
+
+
+def manifest(repo, source, scope, rev=None, ignored=()):
+    cmd = [os.path.join(HERE, "coord-manifest"), "--repo", repo, "--source", source,
+           "--scope", *scope]
+    if rev:
+        cmd += ["--rev", rev]
+    for name in ignored:
+        cmd += ["--ignored-input", name]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr.decode(errors="replace"))
+        die("manifest failed; refusing to record a snapshot that cannot be compared")
+    return r.stdout.decode().strip()
+
+
+def changed_paths(repo):
+    out = git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout
+    paths = []
+    fields = out.split(b"\0")
+    i = 0
+    while i < len(fields):
+        field = fields[i]
+        if not field:
+            i += 1
+            continue
+        status, _, path = field.partition(b" ")
+        path = field[3:] if len(field) > 3 else path
+        if status.startswith(b"R"):
+            i += 1   # rename carries a second path field
+        paths.append(os.fsdecode(path))
+        i += 1
+    return paths
+
+
+def in_scope(path, scope):
+    return any(path == s or path.startswith(s.rstrip("/") + "/") for s in scope)
+
+
+def mint(repo, base, scope):
+    index = tempfile.mktemp(prefix="coord-index-")
+    env = {"GIT_INDEX_FILE": index}
+    try:
+        git(repo, "read-tree", base, env=env)
+        git(repo, "add", "-A", "--", *scope, env=env)
+        tree = git(repo, "write-tree", env=env).stdout.decode().strip()
+    finally:
+        if os.path.exists(index):
+            os.remove(index)
+    return git(repo, "commit-tree", tree, "-p", base, "-m",
+               "coord snapshot").stdout.decode().strip()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--repo", default=".")
+    p.add_argument("--run", required=True)
+    p.add_argument("--message-id", required=True)
+    p.add_argument("--base", required=True)
+    p.add_argument("--scope", nargs="+", required=True)
+    p.add_argument("--ignored-input", action="append", default=[])
+    p.add_argument("--exclude", action="append", default=[],
+                   help="path excluded from the environment fingerprint")
+    args = p.parse_args()
+    excluded_paths = list(ALWAYS_EXCLUDED) + args.exclude
+
+    ref = "refs/coord/%s/%s" % (args.run, args.message_id)
+    if git(args.repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+        die("%s already exists - a snapshot is immutable; mint a new message id for "
+            "a revision" % ref)
+
+    head = git(args.repo, "rev-parse", "HEAD").stdout.decode().strip()
+
+    # Capture stability: worktree before == snapshot-derived == worktree after.
+    # Comparing only the two worktree manifests would not prove either matches what
+    # the snapshot actually stored.
+    stable = False
+    for _ in range(ATTEMPTS):
+        before = manifest(args.repo, "worktree", args.scope)
+        snapshot = mint(args.repo, args.base, args.scope)
+        derived = manifest(args.repo, "tree", args.scope, rev=snapshot)
+        after = manifest(args.repo, "worktree", args.scope)
+        if before == derived == after:
+            stable = True
+            break
+    if not stable:
+        die("the checkout kept moving during capture (%d attempts); pause "
+            "implementation and retry" % ATTEMPTS)
+
+    git(args.repo, "update-ref", ref, snapshot)
+
+    excluded = sorted(p for p in changed_paths(args.repo)
+                      if not in_scope(p, args.scope) and not in_scope(p, excluded_paths))
+    # Never widen to the whole repository just because an input was declared:
+    # "." would pull the mailbox back in through the side door.
+    env_scope = excluded or args.ignored_input or ["."]
+    env_body = manifest(args.repo, "worktree", env_scope, ignored=args.ignored_input) \
+        if excluded or args.ignored_input else ""
+    env_manifest = hashlib.sha256(("%s\0%s" % (head, env_body)).encode()).hexdigest()
+
+    print(json.dumps({
+        "run": args.run,
+        "message_id": args.message_id,
+        "ref": ref,
+        "base": args.base,
+        "head": head,
+        "snapshot": snapshot,
+        "scope": args.scope,
+        "patch_manifest": derived,
+        "worktree_manifest": after,
+        "env_manifest": env_manifest,
+        "excluded": excluded,
+        "stable": stable,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

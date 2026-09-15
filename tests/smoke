@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""End-to-end: a full handoff / changes-requested / revision / approved cycle,
+plus a crash window and a drift invalidation, against a real repository."""
+import json, os, subprocess, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fixtures import commit_all, git, helper, new_repo, write
+
+FAIL = []
+def check(label, ok, detail=""):
+    print(("  PASS  " if ok else "  FAIL  ") + label + (("  — " + detail) if detail else ""))
+    if not ok:
+        FAIL.append(label)
+
+def body(text):
+    fd, p = tempfile.mkstemp(); os.write(fd, text.encode()); os.close(fd); return p
+
+def publish(mbox, frm, to, kind, **kw):
+    args = ["--mailbox", mbox, "--from", frm, "--to", to, "--type", kind,
+            "--body", body(kw.pop("body", "see envelope\n"))]
+    for k, v in kw.items():
+        args += ["--" + k.replace("_", "-"), str(v)]
+    r = helper("coord-publish", *args)
+    assert r.returncode == 0, r.stderr.decode()
+    return r.stdout.decode().strip()
+
+repo = new_repo()
+write(repo, "src/widget.py", b"def widget():\n    return 1\n")
+write(repo, "deps.txt", b"library==1.0\n")
+base = commit_all(repo)
+mbox = os.path.join(repo, ".coord", "2026-09-15-trial")
+helper("coord-check", "--mailbox", mbox, "--role", "implementer", "--init")
+print("\n1. handshake")
+hs = publish(mbox, "implementer", "reviewer", "handshake", body="proposal\n")
+ack = publish(mbox, "reviewer", "implementer", "handshake-ack", reply_to=hs, body="amended: scope is src/\n")
+acc = publish(mbox, "implementer", "reviewer", "handshake-ack", reply_to=ack, body="accepted\n")
+check("amended ack is itself accepted", bool(acc))
+# Each role records what it has acted on; an unrecorded message stays pending,
+# which is correct behaviour, so the handshake is recorded like any other.
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", hs,
+       "--action", "acknowledged", "--response", ack)
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", acc,
+       "--action", "accepted", "--response", "none")
+helper("coord-check", "--mailbox", mbox, "--role", "implementer", "--record", ack,
+       "--action", "accepted", "--response", acc)
+
+print("\n2. implementer works, snapshots, hands off")
+write(repo, "src/widget.py", b"def widget():\n    return 2\n")
+snap1 = json.loads(helper("coord-snapshot", "--repo", repo, "--run", "trial",
+                          "--message-id", "h1", "--base", base, "--scope", "src").stdout)
+h1 = publish(mbox, "implementer", "reviewer", "handoff", checkpoint=1, base=base,
+             snapshot=snap1["snapshot"], patch_manifest=snap1["patch_manifest"],
+             env_manifest=snap1["env_manifest"], body="Checkpoint 1\n")
+check("branch untouched by snapshot", git(repo, "rev-parse", "HEAD").decode().strip() == base)
+
+print("\n3. reviewer verifies and requests changes")
+pend = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
+check("handoff is pending for reviewer", pend["pending"] == [h1])
+v = helper("coord-verify", "--repo", repo, "--base", base, "--snapshot", snap1["snapshot"],
+           "--scope", "src", "--patch-manifest", snap1["patch_manifest"],
+           "--env-manifest", snap1["env_manifest"], "--head", snap1["head"])
+check("verifies clean before review", v.returncode == 0)
+r1 = publish(mbox, "reviewer", "implementer", "review", reply_to=h1, outcome="changes-requested",
+             snapshot=snap1["snapshot"], body="return 2 is still wrong\n")
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h1,
+       "--action", "reviewed", "--response", r1)
+
+print("\n4. environment drift invalidates a stale verification")
+write(repo, "deps.txt", b"library==2.0\n")          # out of scope
+v2 = helper("coord-verify", "--repo", repo, "--base", base, "--snapshot", snap1["snapshot"],
+            "--scope", "src", "--patch-manifest", snap1["patch_manifest"],
+            "--env-manifest", snap1["env_manifest"], "--head", snap1["head"])
+out2 = json.loads(v2.stdout)
+check("patch still matches", out2["patch"] == "match")
+check("environment drift detected", out2["environment"] == "drift", "deps.txt moved out of scope")
+check("verify exits non-zero on drift", v2.returncode != 0)
+
+print("\n5. revision with a fresh snapshot")
+write(repo, "src/widget.py", b"def widget():\n    return 3\n")
+snap2 = json.loads(helper("coord-snapshot", "--repo", repo, "--run", "trial",
+                          "--message-id", "h2", "--base", base, "--scope", "src").stdout)
+check("revision snapshot differs from the first", snap2["snapshot"] != snap1["snapshot"])
+h2 = publish(mbox, "implementer", "reviewer", "revision", reply_to=r1, checkpoint=1,
+             base=base, snapshot=snap2["snapshot"], patch_manifest=snap2["patch_manifest"],
+             env_manifest=snap2["env_manifest"], body="addressed\n")
+
+print("\n6. crash window: response published, journal never written")
+r2 = publish(mbox, "reviewer", "implementer", "review", reply_to=h2, outcome="approved",
+             snapshot=snap2["snapshot"], body="approved at snapshot %s\n" % snap2["snapshot"][:7])
+state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
+check("orphan response reconciled, not duplicated", state["pending"] == [])
+check("reconciliation names the handoff", h2 in [i["message"] for i in state["reconciled"]])
+
+print("\n7. crash window: acted, never responded")
+h3 = publish(mbox, "implementer", "reviewer", "status", body="fyi\n")
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h3, "--action", "reviewing")
+state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
+check("interrupted action is reported", h3 in [i["message"] for i in state["interrupted"]])
+check("interrupted action not re-served as fresh", h3 not in state["pending"])
+
+print("\n8. approval binds to a snapshot")
+with open(os.path.join(mbox, "messages", r2 + ".md")) as f:
+    approved = f.read()
+check("approval names its snapshot", snap2["snapshot"] in approved)
+
+print("\n9. retention")
+e = helper("coord-end", "--repo", repo, "--run", "trial", "--retention", "bundle",
+           "--archive", os.path.join(repo, "trial.bundle"))
+check("bundle archived before refs released", e.returncode == 0 and
+      os.path.exists(os.path.join(repo, "trial.bundle")))
+check("refs released after archiving",
+      git(repo, "for-each-ref", "--format=%(refname)", "refs/coord").decode().strip() == "")
+heads = git(repo, "bundle", "list-heads", os.path.join(repo, "trial.bundle")).decode()
+check("both snapshots survive in the bundle", "h1" in heads and "h2" in heads)
+
+print("\n" + ("FAILED: " + ", ".join(FAIL) if FAIL else "all end-to-end checks passed"))
+sys.exit(1 if FAIL else 0)

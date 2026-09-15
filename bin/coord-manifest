@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Canonical content manifest for coordination review snapshots.
+
+Reads either a git tree or the working tree and emits the same bytes for the same
+content, so a snapshot manifest and a working-tree manifest are directly comparable.
+
+Record   <mode> SP <oid> HT <path> NUL      ordered by path bytes
+Absent   <ABSENT> HT <path> NUL             declared input that does not exist
+
+Writes nothing: no git objects, no index, no references.
+"""
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+
+SUPPORTED_MODES = {b"100644", b"100755", b"120000"}
+
+# Git may refresh the index's stat cache during an otherwise read-only command.
+# The reviewer must not rewrite the index it is reviewing against.
+READ_ONLY_ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+CONVERSION_ATTRS = (b"filter", b"text", b"eol")
+
+
+def die(msg):
+    sys.stderr.write("coord-manifest: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def git_out(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=READ_ONLY_ENV)
+    if r.returncode != 0:
+        die("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r.stdout
+
+
+def object_algorithm(repo):
+    fmt = git_out(repo, "rev-parse", "--show-object-format").decode().strip()
+    if fmt == "sha1":
+        return hashlib.sha1
+    if fmt == "sha256":
+        return hashlib.sha256
+    die("unsupported object format %r" % fmt)
+
+
+def blob_id(data, algorithm):
+    h = algorithm()
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest().encode()
+
+
+def refuse_unsupported(repo):
+    """Configurations where working-tree bytes need not equal the stored blob."""
+    attributes = os.path.join(repo, ".gitattributes")
+    if os.path.exists(attributes):
+        with open(attributes, "rb") as f:
+            body = f.read()
+        for attr in CONVERSION_ATTRS:
+            if attr in body:
+                die(".gitattributes declares %s; content conversion is unsupported "
+                    "- refusing rather than producing a manifest that cannot be "
+                    "compared" % attr.decode())
+    if os.path.exists(os.path.join(repo, ".gitmodules")):
+        die("submodules are unsupported - refusing")
+
+
+def entries_from_tree(repo, rev, scope):
+    raw = git_out(repo, "ls-tree", "-r", "-z", rev, "--", *scope)
+    entries = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition(b"\t")
+        mode, kind, oid = meta.split(b" ")
+        if kind != b"blob":
+            die("unsupported tree entry %r at %r" % (kind.decode(), path.decode(errors="replace")))
+        if mode not in SUPPORTED_MODES:
+            die("unsupported mode %r at %r" % (mode.decode(), path.decode(errors="replace")))
+        entries[path] = (mode, oid)
+    return entries
+
+
+def entries_from_worktree(repo, scope, algorithm):
+    raw = git_out(repo, "ls-files", "-z", "-c", "-o", "--exclude-standard", "--", *scope)
+    repo_bytes = os.fsencode(repo)
+    entries = {}
+    for path in raw.split(b"\0"):
+        if not path:
+            continue
+        full = os.path.join(repo_bytes, path)
+        shown = path.decode(errors="replace")
+        try:
+            stat = os.lstat(full)
+        except FileNotFoundError:
+            # Deleted tracked file: still listed by --cached, absent from the tree.
+            # An absent entry is the correct representation, not a hashing error.
+            continue
+        except OSError as e:
+            die("cannot stat %r: %s" % (shown, e.strerror))
+        if os.path.islink(full):
+            try:
+                target = os.readlink(full)  # exact bytes; never newline-trimmed
+            except OSError as e:
+                die("cannot read link %r: %s" % (shown, e.strerror))
+            entries[path] = (b"120000", blob_id(target, algorithm))
+            continue
+        if os.path.isdir(full):
+            die("unexpected directory entry %r (submodule?)" % shown)
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            die("cannot read %r: %s" % (shown, e.strerror))
+        mode = b"100755" if stat.st_mode & 0o111 else b"100644"
+        entries[path] = (mode, blob_id(data, algorithm))
+    return entries
+
+
+def apply_ignored_inputs(entries, repo, source, declared, algorithm):
+    """Gitignored paths that are real verification inputs.
+
+    Present or absent, the representation is deterministic, so a later creation or
+    deletion shows up as drift instead of vanishing from coverage.
+    """
+    repo_bytes = os.fsencode(repo)
+    for name in declared:
+        path = os.fsencode(name)
+        entries.pop(path, None)
+        if source == "tree":
+            continue
+        full = os.path.join(repo_bytes, path)
+        if not os.path.lexists(full):
+            entries[path] = (b"<ABSENT>", b"")
+            continue
+        if os.path.islink(full):
+            entries[path] = (b"120000", blob_id(os.readlink(full), algorithm))
+            continue
+        try:
+            with open(full, "rb") as f:
+                entries[path] = (b"100644", blob_id(f.read(), algorithm))
+        except OSError as e:
+            die("cannot read declared input %r: %s" % (name, e.strerror))
+
+
+def serialise(entries):
+    out = bytearray()
+    for path in sorted(entries):          # ordered by path bytes, never by record
+        mode, oid = entries[path]
+        out += mode
+        if oid:
+            out += b" " + oid
+        out += b"\t" + path + b"\0"
+    return bytes(out)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--repo", default=".")
+    p.add_argument("--source", choices=("tree", "worktree"), required=True)
+    p.add_argument("--rev", help="required for --source tree")
+    p.add_argument("--scope", nargs="+", required=True)
+    p.add_argument("--ignored-input", action="append", default=[],
+                   help="gitignored path that is a real verification input")
+    p.add_argument("--print", action="store_true",
+                   help="emit the manifest records instead of their digest")
+    args = p.parse_args()
+
+    if not os.path.isdir(args.repo):
+        die("no such repository %r" % args.repo)
+    algorithm = object_algorithm(args.repo)
+    refuse_unsupported(args.repo)
+
+    if args.source == "tree":
+        if not args.rev:
+            die("--rev is required for --source tree")
+        entries = entries_from_tree(args.repo, args.rev, args.scope)
+    else:
+        entries = entries_from_worktree(args.repo, args.scope, algorithm)
+
+    apply_ignored_inputs(entries, args.repo, args.source, args.ignored_input, algorithm)
+
+    body = serialise(entries)
+    if args.print:
+        sys.stdout.buffer.write(body)
+    else:
+        sys.stdout.write(hashlib.sha256(body).hexdigest() + "\n")
+
+
+if __name__ == "__main__":
+    main()

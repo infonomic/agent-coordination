@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Report what a role still has to act on, reconciling both crash windows first.
+
+Delivery is at-least-once with reconciliation. Nothing here claims exactly-once
+execution, so an action that was interrupted is reported for inspection rather than
+repeated blindly.
+"""
+import argparse
+import json
+import os
+import sys
+
+ROLES = ("implementer", "reviewer")
+
+# Replies that conclude the work their parent asked for. A question or a status
+# update is an intermediate reply: it must leave the parent unresolved, or asking
+# for clarification would silently close the review it was about.
+COMPLETING_TYPES = ("review", "revision", "handshake-ack", "decision", "end")
+
+
+def die(msg):
+    sys.stderr.write("coord-check: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def read_frontmatter(path):
+    fields = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        if f.readline().strip() != "---":
+            return fields
+        for line in f:
+            if line.strip() == "---":
+                break
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def load_messages(mailbox):
+    directory = os.path.join(mailbox, "messages")
+    messages = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".md"):
+            continue
+        fields = read_frontmatter(os.path.join(directory, name))
+        fields.setdefault("id", name[:-3])
+        messages.append(fields)
+    return messages
+
+
+def journal_path(mailbox, role):
+    return os.path.join(mailbox, "state", "%s.json" % role)
+
+
+def load_journal(mailbox, role):
+    try:
+        with open(journal_path(mailbox, role)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"last_read": None, "processed": []}
+    except json.JSONDecodeError as e:
+        die("journal for %s is unreadable (%s); inspect it by hand rather than "
+            "letting the run continue from an unknown state" % (role, e))
+
+
+def save_journal(mailbox, role, journal):
+    """Atomic replacement. The journal is mutable, so rename is correct here -
+    unlike a published message, which must never be replaced."""
+    staging = os.path.join(mailbox, "tmp", "%s.journal.tmp" % role)
+    with open(staging, "w") as f:
+        json.dump(journal, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(staging, journal_path(mailbox, role))
+
+
+def reconcile(messages, journal, role):
+    """Recover responses that reached the mailbox before the journal was written."""
+    recorded = {entry["message"] for entry in journal["processed"]}
+    by_reply = {}
+    for message in messages:
+        if message.get("from") != role:
+            continue
+        if message.get("type") not in COMPLETING_TYPES:
+            continue
+        parent = message.get("reply_to")
+        if parent and parent not in ("null", ""):
+            by_reply.setdefault(parent, []).append(message["id"])
+
+    reconciled = []
+    for parent, responses in by_reply.items():
+        if parent in recorded:
+            continue
+        journal["processed"].append({
+            "message": parent,
+            "action": "recovered",
+            "responses": sorted(responses),
+            "at": None,
+            "note": "discovered by reply_to during reconciliation",
+        })
+        recorded.add(parent)
+        reconciled.append({"message": parent, "responses": sorted(responses)})
+    return reconciled
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mailbox", required=True)
+    p.add_argument("--role", required=True, choices=ROLES)
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--record", help="message id this role has finished acting on")
+    p.add_argument("--action", default="processed")
+    p.add_argument("--response", action="append", default=[],
+                   help="id of a message published in response")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args()
+
+    if args.init:
+        for sub in ("messages", "tmp", "state"):
+            os.makedirs(os.path.join(args.mailbox, sub), exist_ok=True)
+        if not args.record:
+            print(args.mailbox)
+            return
+    if not os.path.isdir(os.path.join(args.mailbox, "messages")):
+        die("no mailbox at %r - initialise it with --init" % args.mailbox)
+
+    journal = load_journal(args.mailbox, args.role)
+
+    if args.record:
+        import time
+        journal["processed"].append({
+            "message": args.record,
+            "action": args.action,
+            "responses": list(args.response),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        journal["last_read"] = args.record
+        save_journal(args.mailbox, args.role, journal)
+        return
+
+    messages = load_messages(args.mailbox)
+    reconciled = reconcile(messages, journal, args.role)
+    if reconciled:
+        save_journal(args.mailbox, args.role, journal)
+
+    handled = {entry["message"] for entry in journal["processed"]}
+    interrupted = [
+        {"message": entry["message"], "action": entry["action"]}
+        for entry in journal["processed"]
+        if not entry.get("responses")
+    ]
+    pending = [
+        message["id"] for message in messages
+        if message.get("to") == args.role
+        and message.get("from") != args.role
+        and message["id"] not in handled
+    ]
+
+    state = {
+        "role": args.role,
+        "pending": pending,
+        "interrupted": interrupted,
+        "reconciled": reconciled,
+    }
+
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+    for entry in reconciled:
+        sys.stderr.write("recovered: response to %s was published but not journalled\n"
+                         % entry["message"])
+    for entry in interrupted:
+        sys.stderr.write("interrupted: %s recorded as %r with no published response - "
+                         "inspect its actual state before acting\n"
+                         % (entry["message"], entry["action"]))
+    for message_id in pending:
+        print(message_id)
+
+
+if __name__ == "__main__":
+    main()

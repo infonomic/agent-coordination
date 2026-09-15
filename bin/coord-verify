@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Check a handoff's revision against the working tree, before and after verification.
+
+An immutable snapshot stabilises the diff; it does not make verification run against
+that snapshot. Two fingerprints are therefore checked and reported separately:
+
+  patch        has the reviewed change itself moved?
+  environment  has anything outside the scope moved that could affect verification?
+
+Writes nothing: no git objects, no index, no references.
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Must match coord-snapshot: the mailbox is protocol traffic, not content.
+ALWAYS_EXCLUDED = (".coord",)
+
+# Git may refresh the index's stat cache during an otherwise read-only command.
+# The reviewer must not rewrite the index it is reviewing against.
+READ_ONLY_ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+
+
+def die(msg):
+    sys.stderr.write("coord-verify: %s\n" % msg)
+    raise SystemExit(2)
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, env=READ_ONLY_ENV)
+    if r.returncode != 0:
+        die("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()))
+    return r.stdout
+
+
+def manifest(repo, scope, ignored=(), rev=None):
+    cmd = [os.path.join(HERE, "coord-manifest"), "--repo", repo,
+           "--source", "tree" if rev else "worktree", "--scope", *scope]
+    if rev:
+        cmd += ["--rev", rev]
+    for name in ignored:
+        cmd += ["--ignored-input", name]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr.decode(errors="replace"))
+        die("manifest failed; treat this as drift, not as a pass")
+    return r.stdout.decode().strip()
+
+
+def changed_paths(repo):
+    out = git(repo, "status", "--porcelain", "-z", "--untracked-files=all")
+    paths, fields, i = [], out.split(b"\0"), 0
+    while i < len(fields):
+        field = fields[i]
+        if not field:
+            i += 1
+            continue
+        if field.startswith(b"R"):
+            i += 1
+        paths.append(os.fsdecode(field[3:]))
+        i += 1
+    return paths
+
+
+def in_scope(path, scope):
+    return any(path == s or path.startswith(s.rstrip("/") + "/") for s in scope)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--repo", default=".")
+    p.add_argument("--base", required=True)
+    p.add_argument("--snapshot", required=True)
+    p.add_argument("--scope", nargs="+", required=True)
+    p.add_argument("--patch-manifest", required=True)
+    p.add_argument("--env-manifest", required=True)
+    p.add_argument("--head", required=True)
+    p.add_argument("--ignored-input", action="append", default=[])
+    p.add_argument("--exclude", action="append", default=[],
+                   help="path excluded from the environment fingerprint")
+    args = p.parse_args()
+    excluded_paths = list(ALWAYS_EXCLUDED) + args.exclude
+
+    # The named snapshot must exist, must be what the declared manifest describes,
+    # and must be built on the declared base. Comparing the working tree against a
+    # digest proves none of that: an all-zero snapshot id would "verify".
+    if subprocess.run(["git", "-C", args.repo, "cat-file", "-e", args.snapshot + "^{commit}"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      env=READ_ONLY_ENV).returncode != 0:
+        die("snapshot %s does not exist in this repository" % args.snapshot)
+    snapshot_manifest = manifest(args.repo, args.scope, rev=args.snapshot)
+    if snapshot_manifest != args.patch_manifest:
+        die("snapshot %s does not match the declared patch manifest; the handoff is "
+            "internally inconsistent - request a fresh one" % args.snapshot[:12])
+    parent = git(args.repo, "rev-parse", args.snapshot + "^1").decode().strip()
+    if parent != args.base:
+        die("snapshot %s is built on %s, not the declared base %s"
+            % (args.snapshot[:12], parent[:12], args.base[:12]))
+
+    patch_now = manifest(args.repo, args.scope)
+    head_now = git(args.repo, "rev-parse", "HEAD").decode().strip()
+    excluded = sorted(x for x in changed_paths(args.repo)
+                      if not in_scope(x, args.scope) and not in_scope(x, excluded_paths))
+    # Never widen to the whole repository just because an input was declared:
+    # "." would pull the mailbox back in through the side door.
+    env_body = manifest(args.repo, excluded or args.ignored_input or ["."],
+                        ignored=args.ignored_input) \
+        if excluded or args.ignored_input else ""
+    env_now = hashlib.sha256(("%s\0%s" % (head_now, env_body)).encode()).hexdigest()
+
+    patch = "match" if patch_now == args.patch_manifest else "drift"
+    environment = "match" if env_now == args.env_manifest else "drift"
+    verdict = "verified" if patch == environment == "match" else "invalidated"
+
+    print(json.dumps({
+        "snapshot": args.snapshot,
+        "patch": patch,
+        "environment": environment,
+        "verdict": verdict,
+        "head_expected": args.head,
+        "head_actual": head_now,
+        "excluded": excluded,
+    }, indent=2, sort_keys=True))
+
+    if verdict == "verified":
+        return
+    if patch == "drift":
+        sys.stderr.write("patch drift: the reviewed change has moved; this approval no "
+                         "longer applies - request a fresh handoff\n")
+    if environment == "drift":
+        sys.stderr.write("environment drift: something outside the scope moved; any "
+                         "verification performed no longer applies\n")
+    raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
