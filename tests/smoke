@@ -90,12 +90,32 @@ state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer"
 check("orphan response reconciled, not duplicated", state["pending"] == [])
 check("reconciliation names the handoff", h2 in [i["message"] for i in state["reconciled"]])
 
-print("\n7. crash window: acted, never responded")
+print("\n7. crash window: acted, never completed")
 h3 = publish(mbox, "implementer", "reviewer", "status", body="fyi\n")
-helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h3, "--action", "reviewing")
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h3,
+       "--action", "reviewing", "--in-progress")
 state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
 check("interrupted action is reported", h3 in [i["message"] for i in state["interrupted"]])
 check("interrupted action not re-served as fresh", h3 not in state["pending"])
+
+print("\n7b. the interruption completes when the work finishes")
+r3 = publish(mbox, "reviewer", "implementer", "review", reply_to=h3, outcome="approved",
+             body="done\n")
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h3,
+       "--action", "reviewed", "--response", r3)
+state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
+check("interruption clears once completed", state["interrupted"] == [])
+entries = json.load(open(os.path.join(mbox, "state", "reviewer.json")))["processed"]
+check("history preserved, not duplicated",
+      len([e for e in entries if e["message"] == h3]) == 1)
+
+print("\n7c. a terminal status completes with no response at all")
+h4 = publish(mbox, "implementer", "reviewer", "status", body="no reply needed\n")
+helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--record", h4,
+       "--action", "read; nothing to answer")
+state = json.loads(helper("coord-check", "--mailbox", mbox, "--role", "reviewer", "--json").stdout)
+check("no-response completion is not an interruption", state["interrupted"] == [],
+      "otherwise the protocol pressures agents into fake acknowledgements")
 
 print("\n8. approval binds to a snapshot")
 with open(os.path.join(mbox, "messages", r2 + ".md")) as f:

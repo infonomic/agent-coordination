@@ -70,12 +70,16 @@ class Pending(unittest.TestCase):
 
 
 class CrashWindowActedNotRecorded(unittest.TestCase):
-    """Journal names an action with no published response: interrupted."""
+    """Work declared started and never completed: interrupted.
+
+    Note the contract: interruption is *declared*, not inferred from the absence
+    of a response. Inferring it mislabels legitimate no-response completions.
+    """
 
     def test_interrupted_action_is_reported_not_silently_repeated(self):
         m = new_mailbox()
         mid = publish(m)
-        check(m, "reviewer", "--record", mid, "--action", "reviewed")  # no response
+        check(m, "reviewer", "--record", mid, "--action", "reviewing", "--in-progress")
         state = pending(m)
         self.assertIn(mid, [i["message"] for i in state["interrupted"]])
         self.assertNotIn(mid, state["pending"],
@@ -121,6 +125,98 @@ class IntermediateRepliesDoNotComplete(unittest.TestCase):
         publish(m, frm="reviewer", to="implementer", type="review",
                 outcome="approved", reply_to=mid)
         self.assertEqual([], pending(m)["pending"])
+
+
+class CompletionState(unittest.TestCase):
+    """Completion is recorded intent, not an inference from whether a reply exists.
+
+    Inferring it from responses mislabels legitimate no-response completions --
+    reading a terminal status -- as interrupted, which pressures agents into
+    sending acknowledgement replies nobody wants, or into inventing fake response
+    ids to silence the tool.
+    """
+
+    def test_recording_without_a_response_completes_the_action(self):
+        m = new_mailbox()
+        mid = publish(m, type="status")
+        check(m, "reviewer", "--record", mid, "--action", "read; nothing to answer")
+        state = pending(m)
+        self.assertEqual([], state["interrupted"])
+        self.assertEqual([], state["pending"])
+
+    def test_declaring_work_in_progress_marks_it_interrupted_after_a_crash(self):
+        m = new_mailbox()
+        mid = publish(m)
+        check(m, "reviewer", "--record", mid, "--action", "reviewing", "--in-progress")
+        state = pending(m)
+        self.assertIn(mid, [i["message"] for i in state["interrupted"]])
+        self.assertNotIn(mid, state["pending"])
+
+    def test_an_interruption_completes_when_the_work_finishes(self):
+        m = new_mailbox()
+        mid = publish(m)
+        check(m, "reviewer", "--record", mid, "--action", "reviewing", "--in-progress")
+        rid = publish(m, frm="reviewer", to="implementer", type="review",
+                      outcome="approved", reply_to=mid)
+        check(m, "reviewer", "--record", mid, "--action", "reviewed", "--response", rid)
+        state = pending(m)
+        self.assertEqual([], state["interrupted"],
+                         "an interruption stayed active after the work completed")
+
+    def test_completing_updates_the_entry_rather_than_appending_a_second(self):
+        m = new_mailbox()
+        mid = publish(m)
+        check(m, "reviewer", "--record", mid, "--action", "reviewing", "--in-progress")
+        check(m, "reviewer", "--record", mid, "--action", "reviewed", "--response", "r1")
+        with open(os.path.join(m, "state", "reviewer.json")) as f:
+            journal = json.load(f)
+        entries = [e for e in journal["processed"] if e["message"] == mid]
+        self.assertEqual(1, len(entries), "history duplicated instead of completing")
+        self.assertEqual("completed", entries[0]["state"])
+        self.assertEqual(["r1"], entries[0]["responses"])
+        self.assertEqual("reviewing", entries[0].get("started_as"),
+                         "the original intent was lost instead of preserved")
+
+    def test_reconciliation_completes_an_interrupted_entry(self):
+        """The crash window and the interruption are the same message."""
+        m = new_mailbox()
+        mid = publish(m)
+        check(m, "reviewer", "--record", mid, "--action", "reviewing", "--in-progress")
+        publish(m, frm="reviewer", to="implementer", type="review",
+                outcome="approved", reply_to=mid)      # journal never updated
+        state = pending(m)
+        self.assertEqual([], state["interrupted"],
+                         "a discovered response did not clear the interruption")
+        self.assertIn(mid, [i["message"] for i in state["reconciled"]])
+
+    def test_a_completed_entry_never_reopens(self):
+        m = new_mailbox()
+        mid = publish(m)
+        check(m, "reviewer", "--record", mid, "--action", "reviewed", "--response", "r1")
+        pending(m)
+        state = pending(m)
+        self.assertEqual([], state["interrupted"])
+
+
+class LegacyJournals(unittest.TestCase):
+    """Journals written before completion state existed must still be readable."""
+
+    def _legacy(self, responses):
+        m = new_mailbox()
+        mid = publish(m)
+        with open(os.path.join(m, "state", "reviewer.json"), "w") as f:
+            json.dump({"last_read": mid,
+                       "processed": [{"message": mid, "action": "reviewed",
+                                      "responses": responses, "at": "2026-01-01T00:00:00Z"}]}, f)
+        return m, mid
+
+    def test_legacy_entry_with_a_response_reads_as_completed(self):
+        m, mid = self._legacy(["r1"])
+        self.assertEqual([], pending(m)["interrupted"])
+
+    def test_legacy_entry_without_a_response_reads_as_interrupted(self):
+        m, mid = self._legacy([])
+        self.assertIn(mid, [i["message"] for i in pending(m)["interrupted"]])
 
 
 class JournalIntegrity(unittest.TestCase):

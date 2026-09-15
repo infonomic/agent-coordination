@@ -52,10 +52,23 @@ def journal_path(mailbox, role):
     return os.path.join(mailbox, "state", "%s.json" % role)
 
 
+def migrate(journal):
+    """Journals written before completion state existed carry no `state`.
+
+    Their only signal was whether a response had been published, so that is the
+    rule applied to them - and only to them. New entries record what actually
+    happened instead of inferring it.
+    """
+    for entry in journal.get("processed", []):
+        if "state" not in entry:
+            entry["state"] = "completed" if entry.get("responses") else "in-progress"
+    return journal
+
+
 def load_journal(mailbox, role):
     try:
         with open(journal_path(mailbox, role)) as f:
-            return json.load(f)
+            return migrate(json.load(f))
     except FileNotFoundError:
         return {"last_read": None, "processed": []}
     except json.JSONDecodeError as e:
@@ -75,9 +88,20 @@ def save_journal(mailbox, role, journal):
     os.replace(staging, journal_path(mailbox, role))
 
 
+def find_entry(journal, message_id):
+    for entry in journal["processed"]:
+        if entry["message"] == message_id:
+            return entry
+    return None
+
+
 def reconcile(messages, journal, role):
-    """Recover responses that reached the mailbox before the journal was written."""
-    recorded = {entry["message"] for entry in journal["processed"]}
+    """Recover responses that reached the mailbox before the journal was written.
+
+    A parent already in the journal is still reconciled when its entry is only
+    in-progress: the crash window and the interruption are the same message, so
+    skipping known parents would leave that entry active forever.
+    """
     by_reply = {}
     for message in messages:
         if message.get("from") != role:
@@ -90,16 +114,23 @@ def reconcile(messages, journal, role):
 
     reconciled = []
     for parent, responses in by_reply.items():
-        if parent in recorded:
+        entry = find_entry(journal, parent)
+        if entry is not None and entry["state"] == "completed":
             continue
-        journal["processed"].append({
-            "message": parent,
-            "action": "recovered",
-            "responses": sorted(responses),
-            "at": None,
-            "note": "discovered by reply_to during reconciliation",
-        })
-        recorded.add(parent)
+        if entry is None:
+            journal["processed"].append({
+                "message": parent,
+                "action": "recovered",
+                "started_as": None,
+                "state": "completed",
+                "responses": sorted(responses),
+                "at": None,
+                "note": "discovered by reply_to during reconciliation",
+            })
+        else:
+            entry["state"] = "completed"
+            entry["responses"] = sorted(set(entry.get("responses", [])) | set(responses))
+            entry["note"] = "completed by reply_to during reconciliation"
         reconciled.append({"message": parent, "responses": sorted(responses)})
     return reconciled
 
@@ -113,6 +144,9 @@ def main():
     p.add_argument("--action", default="processed")
     p.add_argument("--response", action="append", default=[],
                    help="id of a message published in response")
+    p.add_argument("--in-progress", action="store_true",
+                   help="declare the action started but not finished, so a crash "
+                        "leaves it reported as interrupted")
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
@@ -129,12 +163,27 @@ def main():
 
     if args.record:
         import time
-        journal["processed"].append({
-            "message": args.record,
-            "action": args.action,
-            "responses": list(args.response),
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        })
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state = "in-progress" if args.in_progress else "completed"
+        entry = find_entry(journal, args.record)
+        if entry is None:
+            journal["processed"].append({
+                "message": args.record,
+                "action": args.action,
+                "started_as": args.action if state == "in-progress" else None,
+                "state": state,
+                "responses": list(args.response),
+                "at": now,
+                "completed_at": None if state == "in-progress" else now,
+            })
+        else:
+            # Complete the existing entry rather than append a second one: the
+            # history is preserved in `started_as`, but it stops being active.
+            entry.setdefault("started_as", entry.get("action"))
+            entry["action"] = args.action
+            entry["state"] = state
+            entry["responses"] = list(args.response) or entry.get("responses", [])
+            entry["completed_at"] = None if state == "in-progress" else now
         journal["last_read"] = args.record
         save_journal(args.mailbox, args.role, journal)
         return
@@ -145,10 +194,12 @@ def main():
         save_journal(args.mailbox, args.role, journal)
 
     handled = {entry["message"] for entry in journal["processed"]}
+    # Interrupted means declared started and never completed - not merely
+    # "no response was published". A terminal status legitimately needs no reply.
     interrupted = [
         {"message": entry["message"], "action": entry["action"]}
         for entry in journal["processed"]
-        if not entry.get("responses")
+        if entry.get("state") == "in-progress"
     ]
     pending = [
         message["id"] for message in messages

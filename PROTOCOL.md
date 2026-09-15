@@ -1,6 +1,6 @@
 ---
 protocol: agent-coordination
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Agent coordination protocol
@@ -182,14 +182,30 @@ exclusion; `.coord` is always excluded.
 
 ## Crash recovery
 
-`coord-check` reconciles before reporting. Two windows:
+`coord-check` reconciles before reporting.
 
-- **Acted, not recorded** — a journal entry with no published response. The action was
-  interrupted: **inspect its actual state and report it.** Do not repeat it blindly.
-  It is reported as `interrupted`, never re-served as fresh work.
+**Completion is declared, never inferred from whether a reply exists.** Declare work
+started with `--in-progress`, and complete it with a plain `--record` — with or
+without `--response`. A terminal status that legitimately needs no reply completes
+with no response at all. Inferring completion from responses mislabels those as
+interrupted, which pressures agents into sending acknowledgements nobody wants, or
+into inventing response ids to quiet the tool.
+
+Two windows:
+
+- **Declared started, never completed** — the action was interrupted: **inspect its
+  actual state and report it.** Do not repeat it blindly. It is reported as
+  `interrupted`, never re-served as fresh work, and it **stops being reported once the
+  work completes** — completing updates that entry rather than appending a second one,
+  preserving the original intent in `started_as`.
 - **Published, not journalled** — the response reached the mailbox and the session
-  died. `coord-check` discovers it by author and `reply_to`, and reconciles the
-  journal, so no duplicate response is published and no implementation work is redone.
+  died. `coord-check` discovers it by author and `reply_to` and reconciles the journal,
+  so no duplicate response is published and no implementation work is redone.
+  Reconciliation also completes an entry that is merely in-progress: the crash window
+  and the interruption can be the same message.
+
+Journals written before completion state existed are migrated on read under the old
+rule — a response means completed — so an existing run stays readable.
 
 **Intermediate replies do not complete their parent.** Only `review`, `revision`,
 `handshake-ack`, `decision` and `end` conclude the work their parent asked for. A
@@ -248,6 +264,7 @@ longer independently reviewable — the tool says so out loud.
 | `coord-verify` | reviewer | nothing |
 | `coord-publish` | both | one message (hard link, never replaces) |
 | `coord-check` | both | that role's journal (atomic replacement) |
+| | | `--in-progress` declares started; plain `--record` completes |
 | `coord-end` | implementer | per the retention policy |
 
 `tests/run` exercises all six. The fixtures are the cases that broke earlier designs:
