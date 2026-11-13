@@ -32,6 +32,15 @@ shim sets `allow_implicit_invocation: false`, so it only runs when named.
 
 ## Usage
 
+> **Note:** once the skills are symlinked and Claude Code or Codex can see the
+> `coordinate` commands, you don't need the long parameterized invocations below.
+> Just ask either agent, in plain language, to begin a coordination session in
+> whichever role you like, for the task you're working on. For example: *"start a
+> coordinate session as implementer for this refactor"*, or *"join the coordinate
+> run as reviewer"*. The explicit forms below are still useful when you want direct
+> control over the run name, plan, checkpoints, verification commands and other
+> parameters.
+
 Open one session of each harness in the project being coordinated. Roles are
 assigned by you at invocation — either harness can take either role.
 
